@@ -211,6 +211,7 @@ struct RelayConnectionOptions {
     prefer_ipv6: Arc<AtomicBool>,
     tls_config: rustls::ClientConfig,
     auth_token: Option<String>,
+    registration_binding: relay::RelayAuthBinding,
 }
 
 /// Possible reasons for a failed relay connection.
@@ -300,6 +301,7 @@ impl ActiveRelayActor {
             prefer_ipv6,
             tls_config,
             auth_token,
+            registration_binding,
         } = opts;
 
         let mut builder = relay::client::ClientBuilder::new(
@@ -317,6 +319,7 @@ impl ActiveRelayActor {
         if let Some(token) = auth_token {
             builder = builder.auth_token(token);
         }
+        builder = builder.registration_binding(registration_binding);
         builder
     }
 
@@ -1341,20 +1344,7 @@ impl RelayActor {
     fn start_active_relay(&mut self, url: RelayUrl) -> ActiveRelayHandle {
         debug!(?url, "Adding relay connection");
 
-        let auth_token = self
-            .config
-            .relay_map
-            .get(&url)
-            .and_then(|cfg| cfg.auth_token.clone());
-        let connection_opts = RelayConnectionOptions {
-            secret_key: self.config.secret_key.clone(),
-            #[cfg(not(wasm_browser))]
-            dns_resolver: self.config.dns_resolver.clone(),
-            proxy_url: self.config.proxy_url.clone(),
-            prefer_ipv6: self.config.ipv6_reported.clone(),
-            tls_config: self.config.tls_config.clone(),
-            auth_token,
-        };
+        let connection_opts = self.connection_options(&url);
 
         // TODO: Replace 64 with PER_CLIENT_SEND_QUEUE_DEPTH once that's unused
         let (send_datagram_tx, send_datagram_rx) = mpsc::channel(64);
@@ -1386,6 +1376,20 @@ impl RelayActor {
         };
         self.log_active_relay();
         handle
+    }
+
+    fn connection_options(&self, url: &RelayUrl) -> RelayConnectionOptions {
+        let (relay_config, registration_binding) = self.config.relay_map.get_with_registration(url);
+        RelayConnectionOptions {
+            secret_key: self.config.secret_key.clone(),
+            #[cfg(not(wasm_browser))]
+            dns_resolver: self.config.dns_resolver.clone(),
+            proxy_url: self.config.proxy_url.clone(),
+            prefer_ipv6: self.config.ipv6_reported.clone(),
+            tls_config: self.config.tls_config.clone(),
+            auth_token: relay_config.and_then(|cfg| cfg.auth_token.clone()),
+            registration_binding,
+        }
     }
 
     /// Triggers an immediate health check on all relay connections after a network change.
@@ -1514,7 +1518,7 @@ mod tests {
 
     use iroh_base::{EndpointId, RelayUrl, SecretKey};
     use iroh_relay::{
-        PingTracker,
+        self as relay, PingTracker, RelayMap,
         protos::relay::Datagrams,
         tls::{CaTlsConfig, default_provider},
     };
@@ -1526,7 +1530,7 @@ mod tests {
 
     use super::{
         ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayMessage, ActiveRelayPrioMessage,
-        Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor, RelayConnectionOptions, RelayMap,
+        Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor, RelayConnectionOptions,
         RelayRecvDatagram, RelaySendItem, UNDELIVERABLE_DATAGRAM_TIMEOUT,
     };
     use crate::{dns::DnsResolver, metrics::SocketMetrics, test_utils};
@@ -1590,6 +1594,7 @@ mod tests {
                     .client_config(default_provider())
                     .expect("infallible"),
                 auth_token: None,
+                registration_binding: iroh_relay::RelayAuthBinding::Legacy,
             },
             stop_token,
             metrics,
@@ -1597,6 +1602,88 @@ mod tests {
         };
         let task = tokio::spawn(ActiveRelayActor::new(opts).run().instrument(span));
         AbortOnDropHandle::new(task)
+    }
+
+    fn actor_for_map(
+        relay_map: RelayMap,
+        secret_key: SecretKey,
+        tls_config: rustls::ClientConfig,
+    ) -> RelayActor {
+        let (relay_datagram_recv_queue, _relay_datagram_recv_rx) = mpsc::channel(1);
+        RelayActor::new(
+            Config {
+                my_relay: Default::default(),
+                secret_key,
+                #[cfg(not(wasm_browser))]
+                dns_resolver: DnsResolver::new(),
+                proxy_url: None,
+                ipv6_reported: Arc::new(AtomicBool::new(false)),
+                tls_config,
+                metrics: Default::default(),
+                relay_map,
+            },
+            relay_datagram_recv_queue,
+            CancellationToken::new(),
+        )
+    }
+
+    fn client_builder_for_actor(
+        actor: &RelayActor,
+        url: RelayUrl,
+    ) -> relay::client::ClientBuilder {
+        ActiveRelayActor::create_relay_builder(url.clone(), actor.connection_options(&url))
+    }
+
+    #[tokio::test]
+    async fn actor_builder_keeps_its_endpoint_owner_across_same_key_replacement() {
+        let url: RelayUrl = "http://127.0.0.1:1/".parse().unwrap();
+        let secret = SecretKey::from_bytes(&[81; 32]);
+        let key = *secret.public().as_bytes();
+        let tls_config = CaTlsConfig::insecure_skip_verify()
+            .client_config(default_provider())
+            .expect("infallible");
+
+        let (_old_tx, old_rx) = tokio::sync::watch::channel(Some("old-live".to_owned()));
+        let old_owner = iroh_relay::relay_token_source::register(url.clone(), key, old_rx, None);
+        let old_map = RelayMap::from(
+            relay::RelayConfig::from(url.clone())
+                .with_auth_token("old-static")
+                .with_registration_owner(old_owner),
+        );
+        old_map.require_registration();
+        let old_actor = actor_for_map(
+            old_map,
+            secret.clone(),
+            tls_config.clone(),
+        );
+        let old_builder = client_builder_for_actor(&old_actor, url.clone());
+
+        let (_new_tx, new_rx) = tokio::sync::watch::channel(Some("new-live".to_owned()));
+        let new_owner = iroh_relay::relay_token_source::register(url.clone(), key, new_rx, None);
+        let new_map = RelayMap::from(
+            relay::RelayConfig::from(url.clone())
+                .with_auth_token("new-static")
+                .with_registration_owner(new_owner),
+        );
+        new_map.require_registration();
+        let new_actor = actor_for_map(new_map, secret, tls_config);
+        let new_builder = client_builder_for_actor(&new_actor, url);
+
+        let old_result = old_builder.connect().await;
+        assert!(matches!(
+            old_result,
+            Err(relay::client::ConnectError::RegistrationSuperseded { .. })
+        ));
+
+        let new_result = new_builder.connect().await;
+        assert!(
+            !matches!(
+                new_result,
+                Err(relay::client::ConnectError::RegistrationSuperseded { .. })
+                    | Err(relay::client::ConnectError::RegistrationOwnerMissing { .. })
+            ),
+            "the current endpoint builder must pass owner validation: {new_result:?}"
+        );
     }
 
     /// Starts an [`ActiveRelayActor`] as an "iroh echo endpoint".
@@ -1955,6 +2042,7 @@ mod tests {
                     .client_config(default_provider())
                     .expect("infallible"),
                 auth_token: None,
+                registration_binding: iroh_relay::RelayAuthBinding::Legacy,
             },
             stop_token: CancellationToken::new(),
             metrics: Default::default(),

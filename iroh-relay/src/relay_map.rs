@@ -10,6 +10,91 @@ use iroh_base::{RelayUrl, RelayUrlParseError};
 use serde::{Deserialize, Serialize};
 
 use crate::defaults::DEFAULT_RELAY_QUIC_PORT;
+use crate::relay_token_source::RegistrationToken;
+
+/// Authorization policy attached to one relay entry.
+///
+/// `BoundRequired(None)` is a sticky fail-closed state: a connection may not
+/// fall back to a static token when its endpoint binding is missing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RelayAuthBinding {
+    /// Preserve the legacy key-only registry and static-token behavior.
+    Legacy,
+    /// Require a matching registration owner; `None` means the owner is absent.
+    BoundRequired(Option<RegistrationToken>),
+}
+
+impl Default for RelayAuthBinding {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
+
+impl RelayAuthBinding {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SerializedRelayAuthBinding {
+    Legacy,
+    BoundRequired,
+}
+
+impl Serialize for RelayAuthBinding {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Legacy => SerializedRelayAuthBinding::Legacy.serialize(serializer),
+            Self::BoundRequired(_) => {
+                SerializedRelayAuthBinding::BoundRequired.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayAuthBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match SerializedRelayAuthBinding::deserialize(deserializer)? {
+            SerializedRelayAuthBinding::Legacy => Self::Legacy,
+            // Registration tokens are process-local identities and are never
+            // serialized. A serialized bound marker must therefore fail closed.
+            SerializedRelayAuthBinding::BoundRequired => Self::BoundRequired(None),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RelayMapState {
+    relays: BTreeMap<RelayUrl, Arc<RelayConfig>>,
+    require_registration: bool,
+}
+
+impl RelayMapState {
+    fn from_configs(mut relays: BTreeMap<RelayUrl, Arc<RelayConfig>>) -> Self {
+        let require_registration = relays
+            .values()
+            .any(|config| !config.registration.is_legacy());
+        if require_registration {
+            for config in relays.values_mut() {
+                if config.registration.is_legacy() {
+                    *config = Arc::new(config.as_ref().clone().with_required_registration(None));
+                }
+            }
+        }
+        Self {
+            relays,
+            require_registration,
+        }
+    }
+}
 
 /// List of relay server configurations to be used in an iroh endpoint.
 ///
@@ -28,15 +113,16 @@ use crate::defaults::DEFAULT_RELAY_QUIC_PORT;
 /// ```
 #[derive(Debug, Clone)]
 pub struct RelayMap {
-    /// A map of the different relay IDs to the [`RelayConfig`] information
-    relays: Arc<RwLock<BTreeMap<RelayUrl, Arc<RelayConfig>>>>,
+    /// Relay configuration and its authorization owner share one lock and
+    /// one entry, so an actor snapshots both atomically.
+    relays: Arc<RwLock<RelayMapState>>,
 }
 
 impl PartialEq for RelayMap {
     fn eq(&self, other: &Self) -> bool {
         let this = self.relays.read().expect("poisoned");
         let that = other.relays.read().expect("poisoned");
-        this.eq(&*that)
+        this.require_registration == that.require_registration && this.relays == that.relays
     }
 }
 
@@ -46,7 +132,7 @@ impl RelayMap {
     /// Creates an empty relay map.
     pub fn empty() -> Self {
         Self {
-            relays: Default::default(),
+            relays: Arc::new(RwLock::new(RelayMapState::default())),
         }
     }
 
@@ -72,7 +158,10 @@ impl RelayMap {
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
-            relays: Arc::new(RwLock::new(relays)),
+            relays: Arc::new(RwLock::new(RelayMapState {
+                relays,
+                require_registration: false,
+            })),
         })
     }
 
@@ -87,6 +176,7 @@ impl RelayMap {
         self.relays
             .read()
             .expect("poisoned")
+            .relays
             .keys()
             .cloned()
             .collect::<T>()
@@ -103,6 +193,7 @@ impl RelayMap {
         self.relays
             .read()
             .expect("poisoned")
+            .relays
             .values()
             .cloned()
             .collect::<T>()
@@ -110,39 +201,112 @@ impl RelayMap {
 
     /// Returns `true` if a relay with `url` is contained in this this relay map.
     pub fn contains(&self, url: &RelayUrl) -> bool {
-        self.relays.read().expect("poisoned").contains_key(url)
+        self.relays
+            .read()
+            .expect("poisoned")
+            .relays
+            .contains_key(url)
     }
 
     /// Returns the config for a relay.
     pub fn get(&self, url: &RelayUrl) -> Option<Arc<RelayConfig>> {
-        self.relays.read().expect("poisoned").get(url).cloned()
+        self.relays
+            .read()
+            .expect("poisoned")
+            .relays
+            .get(url)
+            .cloned()
     }
 
     /// Returns the number of relays in this relay map.
     pub fn len(&self) -> usize {
-        self.relays.read().expect("poisoned").len()
+        self.relays.read().expect("poisoned").relays.len()
     }
 
     /// Returns `true` if this relay map is empty.
     pub fn is_empty(&self) -> bool {
-        self.relays.read().expect("poisoned").is_empty()
+        self.relays.read().expect("poisoned").relays.is_empty()
     }
 
     /// Inserts a new relay into the relay map.
     pub fn insert(&self, url: RelayUrl, endpoint: Arc<RelayConfig>) -> Option<Arc<RelayConfig>> {
-        self.relays.write().expect("poisoned").insert(url, endpoint)
+        let mut state = self.relays.write().expect("poisoned");
+        let previous = state.relays.get(&url).cloned();
+        let mut endpoint = endpoint.as_ref().clone();
+        if let Some(previous) = previous.as_deref() {
+            if let RelayAuthBinding::BoundRequired(old_owner) = &previous.registration {
+                if endpoint.registration.is_legacy() {
+                    endpoint.registration = RelayAuthBinding::BoundRequired(old_owner.clone());
+                }
+            }
+        }
+        if state.require_registration && endpoint.registration.is_legacy() {
+            endpoint.registration = RelayAuthBinding::BoundRequired(None);
+        }
+        if !endpoint.registration.is_legacy() && !state.require_registration {
+            state.require_registration = true;
+            for config in state.relays.values_mut() {
+                if config.registration.is_legacy() {
+                    *config = Arc::new(config.as_ref().clone().with_required_registration(None));
+                }
+            }
+        }
+        state.relays.insert(url, Arc::new(endpoint))
     }
 
     /// Removes an existing relay by its URL.
     pub fn remove(&self, url: &RelayUrl) -> Option<Arc<RelayConfig>> {
-        self.relays.write().expect("poisoned").remove(url)
+        self.relays
+            .write()
+            .expect("poisoned")
+            .relays
+            .remove(url)
     }
 
     /// Extends this `RelayMap` with another one.
     pub fn extend(&self, other: &RelayMap) {
-        let mut a = self.relays.write().expect("poisoned");
-        let b = other.relays.read().expect("poisoned");
-        a.extend(b.iter().map(|(a, b)| (a.clone(), b.clone())));
+        let (other_relays, other_requires_registration) = {
+            let other = other.relays.read().expect("poisoned");
+            (
+                other.relays.clone(),
+                other.require_registration,
+            )
+        };
+        if other_requires_registration {
+            self.require_registration();
+        }
+        for (url, config) in other_relays {
+            self.insert(url, config);
+        }
+    }
+
+    /// Makes authorization ownership mandatory for this endpoint's relay map.
+    /// The requirement is sticky across clones, removals, insertions, and
+    /// extensions. Existing entries without owners become `BoundRequired(None)`.
+    pub fn require_registration(&self) {
+        let mut state = self.relays.write().expect("poisoned");
+        state.require_registration = true;
+        for config in state.relays.values_mut() {
+            if config.registration.is_legacy() {
+                *config = Arc::new(config.as_ref().clone().with_required_registration(None));
+            }
+        }
+    }
+
+    /// Returns an atomic snapshot of a relay's config and owner binding.
+    /// A missing entry in a required map is still fail-closed.
+    pub fn get_with_registration(
+        &self,
+        url: &RelayUrl,
+    ) -> (Option<Arc<RelayConfig>>, RelayAuthBinding) {
+        let state = self.relays.read().expect("poisoned");
+        match state.relays.get(url) {
+            Some(config) => (Some(config.clone()), config.registration.clone()),
+            None if state.require_registration => {
+                (None, RelayAuthBinding::BoundRequired(None))
+            }
+            None => (None, RelayAuthBinding::Legacy),
+        }
     }
 
     /// Sets an authorization token for all relays configured in this relay map.
@@ -153,9 +317,11 @@ impl RelayMap {
     /// See [`RelayConfig::with_auth_token`] for details.
     pub fn with_auth_token(self, auth_token: impl Into<String>) -> Self {
         let auth_token = auth_token.into();
-        for config in self.relays.write().expect("poisoned").values_mut() {
+        let mut state = self.relays.write().expect("poisoned");
+        for config in state.relays.values_mut() {
             *config = Arc::new(config.as_ref().clone().with_auth_token(auth_token.clone()));
         }
+        drop(state);
         self
     }
 }
@@ -169,11 +335,11 @@ impl FromIterator<RelayConfig> for RelayMap {
 impl FromIterator<Arc<RelayConfig>> for RelayMap {
     fn from_iter<T: IntoIterator<Item = Arc<RelayConfig>>>(iter: T) -> Self {
         Self {
-            relays: Arc::new(RwLock::new(
+            relays: Arc::new(RwLock::new(RelayMapState::from_configs(
                 iter.into_iter()
                     .map(|config| (config.url.clone(), config))
                     .collect(),
-            )),
+            ))),
         }
     }
 }
@@ -185,9 +351,9 @@ impl From<RelayUrl> for RelayMap {
     /// discovery ports.
     fn from(value: RelayUrl) -> Self {
         Self {
-            relays: Arc::new(RwLock::new(
+            relays: Arc::new(RwLock::new(RelayMapState::from_configs(
                 [(value.clone(), Arc::new(value.into()))].into(),
-            )),
+            ))),
         }
     }
 }
@@ -195,7 +361,9 @@ impl From<RelayUrl> for RelayMap {
 impl From<RelayConfig> for RelayMap {
     fn from(value: RelayConfig) -> Self {
         Self {
-            relays: Arc::new(RwLock::new([(value.url.clone(), Arc::new(value))].into())),
+            relays: Arc::new(RwLock::new(RelayMapState::from_configs(
+                [(value.url.clone(), Arc::new(value))].into(),
+            ))),
         }
     }
 }
@@ -207,11 +375,11 @@ impl FromIterator<RelayUrl> for RelayMap {
     /// discovery ports.
     fn from_iter<T: IntoIterator<Item = RelayUrl>>(iter: T) -> Self {
         Self {
-            relays: Arc::new(RwLock::new(
+            relays: Arc::new(RwLock::new(RelayMapState::from_configs(
                 iter.into_iter()
                     .map(|url| (url.clone(), Arc::new(url.into())))
                     .collect(),
-            )),
+            ))),
         }
     }
 }
@@ -243,6 +411,11 @@ pub struct RelayConfig {
     /// Set via [`RelayConfig::with_auth_token`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// Endpoint-scoped authorization ownership. The marker serializes, but
+    /// the process-local owner token does not; deserialized bound configs fail
+    /// closed until an owner is explicitly attached.
+    #[serde(default, skip_serializing_if = "RelayAuthBinding::is_legacy")]
+    registration: RelayAuthBinding,
 }
 
 impl RelayConfig {
@@ -252,6 +425,7 @@ impl RelayConfig {
             url,
             quic,
             auth_token: None,
+            registration: RelayAuthBinding::Legacy,
         }
     }
 
@@ -267,6 +441,17 @@ impl RelayConfig {
         self.auth_token = Some(token.into());
         self
     }
+
+    /// Attaches an opaque owner token and makes registration binding required.
+    pub fn with_registration_owner(mut self, owner: RegistrationToken) -> Self {
+        self.registration = RelayAuthBinding::BoundRequired(Some(owner));
+        self
+    }
+
+    fn with_required_registration(mut self, owner: Option<RegistrationToken>) -> Self {
+        self.registration = RelayAuthBinding::BoundRequired(owner);
+        self
+    }
 }
 
 impl From<RelayUrl> for RelayConfig {
@@ -275,6 +460,7 @@ impl From<RelayUrl> for RelayConfig {
             url: value,
             quic: quic_config(),
             auth_token: None,
+            registration: RelayAuthBinding::Legacy,
         }
     }
 }
@@ -352,5 +538,90 @@ mod tests {
 
         map1.extend(&map2);
         assert_eq!(map3, map1);
+    }
+
+    #[test]
+    fn registration_owner_stays_attached_through_clone_and_from_iter() {
+        let url = RelayUrl::from_str("https://owner-snapshot.test").unwrap();
+        let key = [41u8; 32];
+        let (_tx, rx) = tokio::sync::watch::channel(Some("token".to_owned()));
+        let owner = crate::relay_token_source::register(url.clone(), key, rx, None);
+        let config = RelayConfig::from(url.clone()).with_registration_owner(owner.clone());
+        let map = RelayMap::from_iter([config]);
+
+        let cloned = map.clone();
+        let (_, binding) = cloned.get_with_registration(&url);
+        assert_eq!(binding, RelayAuthBinding::BoundRequired(Some(owner.clone())));
+
+        let reconstructed = RelayMap::from_iter(map.relays::<Vec<_>>());
+        let (_, binding) = reconstructed.get_with_registration(&url);
+        assert_eq!(binding, RelayAuthBinding::BoundRequired(Some(owner)));
+    }
+
+    #[test]
+    fn required_registration_cannot_be_downgraded_by_map_mutations() {
+        let url = RelayUrl::from_str("https://sticky-owner.test").unwrap();
+        let legacy = RelayConfig::from(url.clone());
+        let map = RelayMap::from_iter([legacy.clone()]);
+        map.require_registration();
+
+        let binding_of = |map: &RelayMap| {
+            map.get_with_registration(&url).1
+        };
+        assert_eq!(binding_of(&map), RelayAuthBinding::BoundRequired(None));
+
+        let cloned = map.clone();
+        cloned.insert(url.clone(), Arc::new(legacy.clone()));
+        assert_eq!(binding_of(&map), RelayAuthBinding::BoundRequired(None));
+
+        cloned.remove(&url).expect("relay is present");
+        assert_eq!(
+            cloned.get_with_registration(&url).1,
+            RelayAuthBinding::BoundRequired(None)
+        );
+        cloned.insert(url.clone(), Arc::new(legacy.clone()));
+        assert_eq!(binding_of(&map), RelayAuthBinding::BoundRequired(None));
+
+        let legacy_map = RelayMap::from_iter([legacy]);
+        cloned.extend(&legacy_map);
+        assert_eq!(binding_of(&map), RelayAuthBinding::BoundRequired(None));
+
+        let reconstructed = RelayMap::from_iter(cloned.relays::<Vec<_>>());
+        assert_eq!(binding_of(&reconstructed), RelayAuthBinding::BoundRequired(None));
+
+        let another_url = RelayUrl::from_str("https://sticky-owner-other.test").unwrap();
+        let legacy_map = RelayMap::from_iter([
+            RelayConfig::from(url.clone()),
+            RelayConfig::from(another_url.clone()),
+        ]);
+        let (_tx, rx) = tokio::sync::watch::channel(Some("owned".to_owned()));
+        let owner = crate::relay_token_source::register(url.clone(), [43u8; 32], rx, None);
+        legacy_map.insert(
+            url.clone(),
+            Arc::new(RelayConfig::from(url).with_registration_owner(owner)),
+        );
+        assert_eq!(
+            legacy_map.get_with_registration(&another_url).1,
+            RelayAuthBinding::BoundRequired(None)
+        );
+    }
+
+    #[test]
+    fn serialized_binding_preserves_required_mode_without_serializing_owner() {
+        let url = RelayUrl::from_str("https://serialized-owner.test").unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(Some("not-serialized".to_owned()));
+        let owner = crate::relay_token_source::register(url.clone(), [42u8; 32], rx, None);
+        let config = RelayConfig::from(url.clone()).with_registration_owner(owner);
+
+        let encoded = serde_json::to_string(&config).expect("config serializes");
+        assert!(encoded.contains("bound_required"));
+        assert!(!encoded.contains("not-serialized"));
+
+        let decoded: RelayConfig = serde_json::from_str(&encoded).expect("config deserializes");
+        assert_eq!(decoded.registration, RelayAuthBinding::BoundRequired(None));
+        assert_eq!(
+            RelayMap::from(decoded).get_with_registration(&url).1,
+            RelayAuthBinding::BoundRequired(None)
+        );
     }
 }

@@ -38,6 +38,10 @@ mod ping_tracker;
 pub mod protos;
 pub mod quic;
 mod relay_map;
+// Deliberately outside the `server` feature gate: this is a client-side
+// mechanism, and `xross-fabric` — the only caller — never enables `server`.
+// Gating it there would make it unreachable from the one crate that needs it.
+pub mod relay_token_source;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(test)]
@@ -48,7 +52,7 @@ pub use crate::{
     key_cache::KeyCache,
     ping_tracker::PingTracker,
     protos::relay::MAX_PACKET_SIZE,
-    relay_map::{RelayConfig, RelayMap, RelayQuicConfig},
+    relay_map::{RelayAuthBinding, RelayConfig, RelayMap, RelayQuicConfig},
 };
 
 /// Trait for extracting keying material from a TLS connection.
