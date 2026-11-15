@@ -145,14 +145,18 @@ pub struct RelayConfig {
     pub key_cache_capacity: Option<usize>,
     /// Access control for incoming connections.
     pub access: Arc<dyn DynAccessControl>,
+    /// Observer for relayed traffic, per endpoint pair. Disabled if `None`.
+    ///
+    /// See [`RelayMetering`], and note its warning about the hot path.
+    pub metering: Option<Arc<dyn RelayMetering>>,
 }
 
 impl RelayConfig {
     /// Creates a new [`RelayConfig`] bound to `http_bind_addr` with default settings.
     ///
     /// TLS is disabled, default [`Limits`] are used, the key cache capacity is unset, and
-    /// access defaults to [`AllowAll`]. Adjust any of these by assigning to the
-    /// corresponding fields after construction.
+    /// access defaults to [`AllowAll`], and metering is off. Adjust any of these
+    /// by assigning to the corresponding fields after construction.
     pub fn new(http_bind_addr: impl Into<SocketAddr>) -> Self {
         Self {
             http_bind_addr: http_bind_addr.into(),
@@ -160,6 +164,7 @@ impl RelayConfig {
             limits: Limits::default(),
             key_cache_capacity: None,
             access: Arc::new(AllowAll),
+            metering: None,
         }
     }
 }
@@ -181,6 +186,8 @@ impl ConnectionId {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
+
+
 }
 
 /// Details about an incoming relay client connection.
@@ -332,6 +339,52 @@ impl<T: AccessControl> DynAccessControl for T {
     fn on_disconnect(&self, endpoint_id: EndpointId, connection_id: ConnectionId) {
         <Self as AccessControl>::on_disconnect(self, endpoint_id, connection_id)
     }
+}
+
+/// Re-exported so an out-of-crate [`RelayMetering`] can name its own parameters.
+///
+/// `AccessControl` never needed this — an implementer reaches an endpoint id
+/// through `ClientRequest::endpoint_id()` and can leave the type unnamed. An
+/// implementer of [`RelayMetering`] cannot: the id arrives as an argument. A
+/// hook nobody outside the crate can write is not a hook, so this is part of
+/// the same addition rather than a convenience.
+pub use iroh_base::EndpointId as MeteredEndpointId;
+
+/// Observes relayed traffic, so an embedder can attribute it to an endpoint.
+///
+/// [`AccessControl`] lets an embedder decide *who* may use a relay; without a
+/// counterpart it cannot learn *how much* any of them used. The server's own
+/// [`Metrics`] are process-wide aggregates with no per-endpoint dimension, so an
+/// operator running a relay for identified users has no way to build a quota,
+/// bill usage, or find the endpoint responsible for a traffic spike.
+///
+/// Install one on [`RelayConfig::metering`]. It is called once per relayed
+/// datagram frame, from the forwarding path, with both endpoints already
+/// authenticated by the relay handshake.
+///
+/// # This is on the hot path
+///
+/// It runs inline for every forwarded frame, holding no lock of the relay's own
+/// but blocking the sender's actor while it runs. An implementation must be
+/// cheap and non-blocking: increment an in-memory counter, or push to a bounded
+/// channel and let another task do the work. Do not perform I/O here.
+pub trait RelayMetering: std::fmt::Debug + Send + Sync + 'static {
+    /// `bytes` of datagram payload were accepted for delivery from `src` to
+    /// `dst`.
+    ///
+    /// Called only when the frame was **accepted into the destination's send
+    /// queue**. A frame dropped because the destination is absent or its queue
+    /// is full is not reported, because the relay did not carry it.
+    ///
+    /// Note what that does and does not promise: the bytes are committed to a
+    /// connected client's queue, not confirmed on the wire. A connection that
+    /// dies with a full queue took bandwidth this reports and delivered less. It
+    /// is the closest measure available at a single choke point, and it is the
+    /// one the relay itself acts on.
+    ///
+    /// `bytes` counts datagram contents only — not relay framing, and not the
+    /// control messages (`Ping`, `Pong`) that share the connection.
+    fn on_relay(&self, src: EndpointId, dst: EndpointId, bytes: usize);
 }
 
 /// An [`AccessControl`] that admits every endpoint.
@@ -734,6 +787,7 @@ impl Server {
                     .headers(headers)
                     .key_cache_capacity(key_cache_capacity)
                     .access(relay_config.access)
+                    .metering(relay_config.metering)
                     .request_handler(Method::GET, "/", Box::new(root_handler))
                     .request_handler(Method::GET, "/index.html", Box::new(root_handler))
                     .request_handler(Method::GET, RELAY_PROBE_PATH, Box::new(probe_handler))

@@ -10,7 +10,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, trace};
 
 use super::{
-    ConnectionId, OnDisconnectGuard,
+    ConnectionId, OnDisconnectGuard, RelayMetering,
     client::{Client, Config, ForwardPacketError},
 };
 use crate::{
@@ -34,6 +34,22 @@ struct Inner {
     clients: DashMap<EndpointId, ClientState>,
     /// Map of which client has sent where
     sent_to: DashMap<EndpointId, HashSet<EndpointId>>,
+    /// Observer for relayed traffic, per endpoint pair. `None` disables it and
+    /// leaves the forwarding path exactly as it was.
+    metering: Option<Arc<dyn RelayMetering>>,
+}
+
+impl Clients {
+    /// A registry that reports every forwarded frame to `metering`.
+    ///
+    /// `Clients::default()` is the unmetered form and stays the cheap one: with
+    /// `None` here the forwarding path costs one `Option` check per frame.
+    pub fn with_metering(metering: Option<Arc<dyn RelayMetering>>) -> Self {
+        Self(Arc::new(Inner {
+            metering,
+            ..Default::default()
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -209,10 +225,23 @@ impl Clients {
             metrics.send_packets_dropped.inc();
             return Ok(());
         };
+        // Read before the move. This is the one place in the server where the
+        // sender, the recipient and the payload size are all in hand at once,
+        // which is why the metering hook lives here rather than at the two
+        // per-connection byte counters in `client.rs` — neither of those knows
+        // the endpoint at the *other* end.
+        let relayed_bytes = data.contents.len();
+
         match client.active.try_send_packet(src, data) {
             Ok(_) => {
                 // Record sent_to relationship
                 self.0.sent_to.entry(src).or_default().insert(dst);
+                // Only on success: a frame the relay dropped is a frame the
+                // relay did not carry, and billing for it would charge a sender
+                // for the recipient's backpressure.
+                if let Some(metering) = &self.0.metering {
+                    metering.on_relay(src, dst, relayed_bytes);
+                }
                 Ok(())
             }
             Err(TrySendError::Full(_)) => {
@@ -259,6 +288,143 @@ mod tests {
         protos::{common::FrameType, relay::RelayToClientMsg, streams::WsBytesFramed},
         server::streams::{MaybeTlsStream, RateLimited, ServerRelayedStream},
     };
+
+    /// Records what a [`RelayMetering`] hook was told, for the tests below.
+    #[derive(Debug, Default)]
+    struct Recorder(std::sync::Mutex<Vec<(EndpointId, EndpointId, usize)>>);
+
+    impl RelayMetering for Recorder {
+        fn on_relay(&self, src: EndpointId, dst: EndpointId, bytes: usize) {
+            self.0.lock().expect("not poisoned").push((src, dst, bytes));
+        }
+    }
+
+    impl Recorder {
+        fn calls(&self) -> Vec<(EndpointId, EndpointId, usize)> {
+            self.0.lock().expect("not poisoned").clone()
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn metering_reports_a_forwarded_frame_once_with_both_endpoints() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let a_key = SecretKey::from_bytes(&rng.random()).public();
+        let b_key = SecretKey::from_bytes(&rng.random()).public();
+
+        let (a_builder, mut a_rw) = test_client_builder(a_key);
+        let recorder = Arc::new(Recorder::default());
+        let clients = Clients::with_metering(Some(recorder.clone()));
+        let metrics = Arc::new(Metrics::default());
+        clients.register(a_builder, metrics.clone());
+
+        let data = b"hello world!";
+        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;
+
+        // `b` sent to `a`, and the size is the datagram contents -- not the
+        // relay framing around them.
+        assert_eq!(recorder.calls(), vec![(b_key, a_key, data.len())]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn metering_says_nothing_about_a_frame_with_no_destination() -> Result {
+        // Nobody is registered for `a_key`, so the frame is dropped. Reporting
+        // it would bill a sender for traffic that never reached anyone -- and
+        // the drop is already counted in `send_packets_dropped`.
+        //
+        // Note what this row does NOT cover: `send_packet` returns before the
+        // metering point when the destination is absent, so moving the hook
+        // ahead of the send would leave this green. That case is
+        // `metering_counts_only_the_frames_the_queue_accepted`.
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1u64);
+        let a_key = SecretKey::from_bytes(&rng.random()).public();
+        let b_key = SecretKey::from_bytes(&rng.random()).public();
+
+        let recorder = Arc::new(Recorder::default());
+        let clients = Clients::with_metering(Some(recorder.clone()));
+        let metrics = Arc::new(Metrics::default());
+
+        clients.send_packet(a_key, Datagrams::from(&b"dropped"[..]), b_key, &metrics)?;
+
+        assert!(recorder.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn metering_counts_only_the_frames_the_queue_accepted() -> Result {
+        // The row that actually pins the hook to the `Ok` arm. The destination
+        // is registered but nobody reads its stream, so its send queue fills and
+        // further frames are refused with `TrySendError::Full`. A hook placed
+        // before the send would report every attempt and bill a sender for the
+        // recipient's backpressure.
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(3u64);
+        let a_key = SecretKey::from_bytes(&rng.random()).public();
+        let b_key = SecretKey::from_bytes(&rng.random()).public();
+
+        let (mut config, _a_rw) = test_client_builder(a_key);
+        config.channel_capacity = 1;
+
+        let recorder = Arc::new(Recorder::default());
+        let clients = Clients::with_metering(Some(recorder.clone()));
+        let metrics = Arc::new(Metrics::default());
+        clients.register(config, metrics.clone());
+
+        // `_a_rw` is never read, so the client actor stalls writing and the
+        // queue stops draining. Send until one is refused, then keep going, so
+        // the test does not depend on exactly where the boundary falls.
+        let data = b"backpressure";
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..256 {
+            match clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics) {
+                Ok(()) => accepted += 1,
+                Err(_) => refused += 1,
+            }
+        }
+
+        assert!(
+            refused > 0,
+            "the queue never filled, so this test proved nothing"
+        );
+        assert_eq!(
+            recorder.calls().len(),
+            accepted,
+            "the meter counted attempts rather than accepted frames"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn an_unmetered_registry_still_forwards() -> Result {
+        // `Clients::default()` is the unmetered form, and it is what every
+        // existing embedder gets. This asserts the hook changed nothing when it
+        // is absent.
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(2u64);
+        let a_key = SecretKey::from_bytes(&rng.random()).public();
+        let b_key = SecretKey::from_bytes(&rng.random()).public();
+
+        let (a_builder, mut a_rw) = test_client_builder(a_key);
+        let clients = Clients::default();
+        let metrics = Arc::new(Metrics::default());
+        clients.register(a_builder, metrics.clone());
+
+        let data = b"hello world!";
+        clients.send_packet(a_key, Datagrams::from(&data[..]), b_key, &metrics)?;
+        let frame = recv_frame(FrameType::RelayToClientDatagram, &mut a_rw).await?;
+        assert_eq!(
+            frame,
+            RelayToClientMsg::Datagrams {
+                remote_endpoint_id: b_key,
+                datagrams: data.to_vec().into(),
+            }
+        );
+        Ok(())
+    }
 
     async fn recv_frame<
         E: std::error::Error + Sync + Send + 'static,

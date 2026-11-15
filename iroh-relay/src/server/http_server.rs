@@ -32,7 +32,7 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use super::{
-    AllowAll, ClientRequest, DynAccessControl, SpawnError, clients::Clients,
+    AllowAll, ClientRequest, DynAccessControl, RelayMetering, SpawnError, clients::Clients,
     streams::InvalidBucketConfig,
 };
 use crate::{
@@ -352,6 +352,8 @@ pub(super) struct ServerBuilder {
     key_cache_capacity: usize,
     /// Access control for endpoints.
     access: Arc<dyn DynAccessControl>,
+    /// Observer for relayed traffic. Disabled if `None`.
+    metering: Option<Arc<dyn RelayMetering>>,
     metrics: Option<Arc<Metrics>>,
     establish_timeout: Duration,
 }
@@ -367,6 +369,7 @@ impl ServerBuilder {
             client_rx_ratelimit: None,
             key_cache_capacity: DEFAULT_KEY_CACHE_CAPACITY,
             access: Arc::new(AllowAll),
+            metering: None,
             metrics: None,
             establish_timeout: ESTABLISH_TIMEOUT,
         }
@@ -381,6 +384,12 @@ impl ServerBuilder {
     /// Set the access control.
     pub(super) fn access(mut self, access: Arc<dyn DynAccessControl>) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Set the traffic observer.
+    pub(super) fn metering(mut self, metering: Option<Arc<dyn RelayMetering>>) -> Self {
+        self.metering = metering;
         self
     }
 
@@ -442,12 +451,13 @@ impl ServerBuilder {
     pub(super) async fn spawn(self) -> Result<Server, SpawnError> {
         let cancel_token = CancellationToken::new();
 
-        let service = RelayService::new(
+        let service = RelayService::with_metering(
             self.handlers,
             self.headers,
             self.client_rx_ratelimit,
             KeyCache::new(self.key_cache_capacity),
             self.access,
+            self.metering,
             self.metrics.unwrap_or_default(),
         );
 
@@ -921,10 +931,28 @@ impl RelayService {
         access: Arc<dyn DynAccessControl>,
         metrics: Arc<Metrics>,
     ) -> Self {
+        Self::with_metering(handlers, headers, rate_limit, key_cache, access, None, metrics)
+    }
+
+    /// Creates a new RelayService that reports relayed traffic to `metering`.
+    ///
+    /// A separate constructor rather than a seventh parameter on [`Self::new`],
+    /// so adding metering breaks no existing embedder — including this crate's
+    /// own tests, whose passing unchanged is the evidence that an unmetered
+    /// relay behaves exactly as it did.
+    pub fn with_metering(
+        handlers: Handlers,
+        headers: HeaderMap,
+        rate_limit: Option<ClientRateLimit>,
+        key_cache: KeyCache,
+        access: Arc<dyn DynAccessControl>,
+        metering: Option<Arc<dyn RelayMetering>>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self(Arc::new(Inner {
             handlers,
             headers,
-            clients: Clients::default(),
+            clients: Clients::with_metering(metering),
             write_timeout: SERVER_WRITE_TIMEOUT,
             rate_limit: watch::Sender::new(rate_limit),
             key_cache,
