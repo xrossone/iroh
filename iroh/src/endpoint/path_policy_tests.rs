@@ -5,7 +5,14 @@
 //! exists (a trap socket, the relay server, the remote's candidate set). The comment on each
 //! test names the guard whose removal must make it fail.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use iroh_base::{EndpointAddr, TransportAddr};
 use iroh_relay::tls::CaTlsConfig;
@@ -462,6 +469,101 @@ async fn strict_address_exposure_follows_policy() -> Result {
     assert!(addr.addrs.iter().any(|a| a.is_relay()));
 
     ep.close().await;
+    open.close().await;
+    Ok(())
+}
+
+/// Counts TCP connections and UDP datagrams reaching a fake relay (HTTPS and QAD ports).
+async fn relay_trap() -> Result<(crate::RelayUrl, u16, Arc<AtomicUsize>)> {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .anyerr()?;
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.anyerr()?;
+    let port = tcp.local_addr().anyerr()?.port();
+    let qad_port = udp.local_addr().anyerr()?.port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    tokio::spawn(async move {
+        // Accept and drop at once, so probes fail fast instead of hanging.
+        while let Ok((conn, _)) = tcp.accept().await {
+            h.fetch_add(1, Ordering::SeqCst);
+            drop(conn);
+        }
+    });
+    let h = hits.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while udp.recv_from(&mut buf).await.is_ok() {
+            h.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let url: crate::RelayUrl = format!("http://127.0.0.1:{port}").parse().anyerr()?;
+    Ok((url, qad_port, hits))
+}
+
+/// Guards (review A2): `insert_relay` is refused without RELAY, and the net report (relay
+/// HTTPS and QAD probes) does not run after a `restrict` that removes RELAY. The fake relay's
+/// connection counter is the outside witness.
+#[tokio::test]
+#[traced_test]
+async fn strict_direct_never_contacts_relay_infrastructure() -> Result {
+    use iroh_relay::{RelayConfig, RelayQuicConfig};
+
+    // Direct-only endpoint: inserting a relay is refused and nothing contacts it.
+    let (url, qad_port, hits) = relay_trap().await?;
+    let config = || {
+        Arc::new(RelayConfig::new(
+            url.clone(),
+            Some(RelayQuicConfig::new(qad_port)),
+        ))
+    };
+    let direct = endpoint(
+        PathPolicy::strict(PathClasses::DIRECT, 1).unwrap(),
+        None,
+        true,
+    )
+    .await?;
+    assert!(direct.insert_relay(url.clone(), config()).await.is_none());
+    assert!(
+        direct.remove_relay(&url).await.is_none(),
+        "a direct-only endpoint stored a relay"
+    );
+    direct.inner.force_network_change(true).await;
+    time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the relay was contacted");
+
+    // Permissive endpoint without a relay transport: an inserted relay is probed until the
+    // policy drops RELAY, and not afterwards.
+    let (url, qad_port, hits) = relay_trap().await?;
+    let config = Arc::new(RelayConfig::new(
+        url.clone(),
+        Some(RelayQuicConfig::new(qad_port)),
+    ));
+    let open = endpoint(PathPolicy::permissive(), None, true).await?;
+    open.insert_relay(url.clone(), config).await;
+    time::timeout(Duration::from_secs(10), async {
+        while hits.load(Ordering::SeqCst) == 0 {
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .std_context("the net report never probed the relay")?;
+    open.path_policy().restrict(1, PathClasses::DIRECT).unwrap();
+    // Let a report already in flight finish (probes fail fast against the trap).
+    time::sleep(Duration::from_secs(3)).await;
+    let before = hits.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        open.inner.force_network_change(true).await;
+        time::sleep(Duration::from_millis(700)).await;
+    }
+    time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before,
+        "the relay was probed after the policy dropped relays"
+    );
+
+    direct.close().await;
     open.close().await;
     Ok(())
 }

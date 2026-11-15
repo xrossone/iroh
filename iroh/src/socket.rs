@@ -813,6 +813,24 @@ impl DirectAddrUpdateState {
             self.sock.net_report.set((None, why)).ok();
             return;
         }
+        // The net report probes relay servers (HTTPS, and QAD over QUIC): relay-class
+        // contact, so it does not run while the policy refuses relays.
+        if !self
+            .sock
+            .path_policy
+            .allows(path_policy::PathClasses::RELAY)
+        {
+            debug!("skipping net_report, path policy refuses relays");
+            self.sock.net_report.set((None, why)).ok();
+            if !self
+                .sock
+                .path_policy
+                .allows(path_policy::PathClasses::DIRECT)
+            {
+                self.port_mapper.deactivate();
+            }
+            return;
+        }
 
         if self
             .sock
@@ -1301,6 +1319,10 @@ impl EndpointInner {
         relay: RelayUrl,
         endpoint: Arc<RelayConfig>,
     ) -> Option<Arc<RelayConfig>> {
+        if !self.sock.path_policy.allows(path_policy::PathClasses::RELAY) {
+            warn!("path policy does not allow relays; relay not added");
+            return None;
+        }
         let res = self.relay_map.insert(relay, endpoint);
         self.actor_sender
             .send(ActorMessage::RelayMapChange)
