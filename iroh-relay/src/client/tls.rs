@@ -131,7 +131,11 @@ impl MaybeTlsStreamBuilder {
         tls_connector: &tokio_rustls::TlsConnector,
     ) -> Result<util::Chain<std::io::Cursor<Bytes>, MaybeTlsStream<tokio::net::TcpStream>>, DialError>
     {
-        debug!(%self.url, %proxy_url, "dial url via proxy");
+        debug!(
+            relay_url = %redacted_url(&self.url),
+            proxy_url = %redacted_url(&proxy_url),
+            "dial url via proxy"
+        );
 
         let tcp_stream = dial_happy_eyeballs(&self.dns_resolver, &proxy_url, self.prefer_ipv6)
             .await
@@ -146,7 +150,7 @@ impl MaybeTlsStreamBuilder {
         } else {
             let hostname = proxy_url.host_str().ok_or_else(|| {
                 e!(DialError::ProxyInvalidUrl {
-                    proxy_url: proxy_url.clone()
+                    proxy_url: redacted_url(&proxy_url)
                 })
             })?;
             let hostname =
@@ -162,7 +166,7 @@ impl MaybeTlsStreamBuilder {
 
         let target_host = self.url.host_str().ok_or_else(|| {
             e!(DialError::InvalidUrl {
-                url: self.url.clone()
+                url: redacted_url(&self.url)
             })
         })?;
 
