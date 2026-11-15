@@ -16,7 +16,7 @@ use relay::{RelayNetworkChangeSender, RelaySender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, trace, warn};
 
-use super::{Socket, mapped_addrs::MultipathMappedAddr};
+use super::{Socket, mapped_addrs::MultipathMappedAddr, path_policy::PathPolicy};
 use crate::{
     endpoint::RelayStatus,
     metrics::EndpointMetrics,
@@ -52,6 +52,9 @@ pub(crate) struct Transports {
     ip: IpTransports,
     relay: Vec<RelayTransport>,
     custom: Vec<Box<dyn CustomEndpoint>>,
+
+    /// Which classes of network path may be used (Xross fork).
+    path_policy: PathPolicy,
 
     poll_recv_counter: usize,
     /// Cache for per-packet recv info, to speed up access
@@ -168,6 +171,17 @@ impl TransportConfig {
         }
     }
 
+    /// The path class of the transport this configuration builds.
+    pub(crate) fn path_class(&self) -> super::path_policy::PathClasses {
+        use super::path_policy::PathClasses;
+        match self {
+            #[cfg(not(wasm_browser))]
+            Self::Ip { .. } => PathClasses::DIRECT,
+            Self::Relay { .. } => PathClasses::RELAY,
+            Self::Custom(_) => PathClasses::CUSTOM,
+        }
+    }
+
     /// Is this configuration set by the user.
     pub(crate) fn is_user_defined(&self) -> bool {
         match self {
@@ -190,6 +204,7 @@ impl Transports {
         relay_actor_config: RelayActorConfig,
         metrics: &EndpointMetrics,
         shutdown_token: CancellationToken,
+        path_policy: PathPolicy,
     ) -> io::Result<Self> {
         #[cfg(not(wasm_browser))]
         let ip_configs = {
@@ -245,6 +260,7 @@ impl Transports {
             ip,
             relay,
             custom,
+            path_policy,
             poll_recv_counter: Default::default(),
             recv_infos: Default::default(),
             consecutive_total_recv_failures: 0,
@@ -268,8 +284,33 @@ impl Transports {
             Poll::Pending => Poll::Pending,
             Poll::Ready(0) => Poll::Ready(Ok(0)),
             Poll::Ready(n) => {
+                self.drop_disallowed(&mut bufs[..n], &metas[..n]);
                 sock.process_datagrams(&mut bufs[..n], &mut metas[..n], &self.recv_infos[..n]);
                 Poll::Ready(Ok(n))
+            }
+        }
+    }
+
+    /// Receive boundary: makes QUIC drop every datagram from a path class the policy refuses.
+    ///
+    /// The endpoint runs noq with `grease_quic_bit(false)`, so a datagram whose first byte has
+    /// the QUIC fixed bit unset is discarded during header decoding, before any connection,
+    /// path or migration state is touched. Zeroing the first byte of each segment uses that.
+    fn drop_disallowed(&self, bufs: &mut [IoSliceMut<'_>], metas: &[noq_udp::RecvMeta]) {
+        for ((buf, meta), info) in bufs.iter_mut().zip(metas).zip(&self.recv_infos) {
+            if self.path_policy.admit_recv(info.remote()) {
+                continue;
+            }
+            let len = meta.len.min(buf.len());
+            let stride = if meta.stride == 0 {
+                len.max(1)
+            } else {
+                meta.stride
+            };
+            let mut offset = 0;
+            while offset < len {
+                buf[offset] = 0;
+                offset += stride;
             }
         }
     }
@@ -476,6 +517,7 @@ impl Transports {
             relay,
             custom,
             max_transmit_segments,
+            path_policy: self.path_policy.clone(),
         }
     }
 
@@ -958,6 +1000,8 @@ pub(crate) struct TransportsSender {
     relay: Vec<RelaySender>,
     custom: Vec<Arc<dyn CustomSender>>,
     max_transmit_segments: NonZeroUsize,
+    /// Which classes of network path may be used (Xross fork).
+    path_policy: PathPolicy,
 }
 
 impl TransportsSender {
@@ -968,6 +1012,15 @@ impl TransportsSender {
         network_path: &FourTuple,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
+        // Send boundary: every datagram, including Initials queued before a policy change,
+        // retransmissions on already-open paths, path probes and address discovery, passes
+        // here. A refused datagram is reported as sent, so QUIC treats it as lost; an error
+        // would stop the endpoint driver.
+        if !self.path_policy.admit_send(network_path) {
+            trace!(%network_path, "path policy refused datagram");
+            return Poll::Ready(Ok(()));
+        }
+        let path_policy = self.path_policy.clone();
         match network_path {
             #[cfg(wasm_browser)]
             FourTuple::Ip { .. } => {
@@ -984,11 +1037,13 @@ impl TransportsSender {
                         .v4_iter_mut()
                         .find(|s| s.is_valid_send_addr(*src, dst_addr))
                     {
+                        path_policy.record_dispatch(network_path);
                         return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
                     }
                     if let Some(sender) = self.ip.v4_default_mut()
                         && sender.is_valid_default_addr(*src, dst_addr)
                     {
+                        path_policy.record_dispatch(network_path);
                         return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
                     }
                 }
@@ -998,11 +1053,13 @@ impl TransportsSender {
                         .v6_iter_mut()
                         .find(|s| s.is_valid_send_addr(*src, dst_addr))
                     {
+                        path_policy.record_dispatch(network_path);
                         return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
                     }
                     if let Some(sender) = self.ip.v6_default_mut()
                         && sender.is_valid_default_addr(*src, dst_addr)
                     {
+                        path_policy.record_dispatch(network_path);
                         return Pin::new(sender).poll_send(cx, *dst_addr, *src, transmit);
                     }
                 }
@@ -1015,6 +1072,7 @@ impl TransportsSender {
                     .filter(|s| s.is_valid_send_addr(url, endpoint_id))
                 {
                     has_valid_sender = true;
+                    path_policy.record_dispatch(network_path);
                     match sender.poll_send(cx, url.clone(), *endpoint_id, transmit) {
                         Poll::Pending => {}
                         Poll::Ready(res) => return Poll::Ready(res),
@@ -1027,6 +1085,7 @@ impl TransportsSender {
             FourTuple::Custom { remote, local } => {
                 for sender in &mut self.custom {
                     if sender.is_valid_send_addr(remote) {
+                        path_policy.record_dispatch(network_path);
                         match sender.poll_send(cx, remote, local.as_ref(), transmit) {
                             Poll::Pending => {}
                             Poll::Ready(res) => return Poll::Ready(res),
@@ -1333,6 +1392,7 @@ mod tests {
                 relay: vec![sender],
                 custom: Vec::new(),
                 max_transmit_segments: NonZeroUsize::new(1).unwrap(),
+                path_policy: PathPolicy::permissive(),
             };
             (
                 sender,
@@ -1389,6 +1449,7 @@ mod tests {
             poll_recv_counter: 0,
             recv_infos: Default::default(),
             consecutive_total_recv_failures: 0,
+            path_policy: PathPolicy::permissive(),
         }
     }
 

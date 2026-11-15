@@ -91,6 +91,7 @@ mod metrics;
 pub(crate) mod biased_rtt_path_selector;
 pub(crate) mod concurrent_read_map;
 pub(crate) mod mapped_addrs;
+pub(crate) mod path_policy;
 pub(crate) mod remote_map;
 pub(crate) mod transports;
 
@@ -190,6 +191,8 @@ pub(crate) struct Options {
     pub(crate) path_selector: Arc<dyn PathSelector>,
     pub(crate) portmapper_config: portmapper::PortmapperConfig,
     pub(crate) net_report_config: crate::net_report::NetReportConfig,
+    /// Which classes of network path this endpoint may create and use.
+    pub(crate) path_policy: path_policy::PathPolicy,
 
     /// Static configuration for the endpoint.
     pub(crate) static_config: StaticConfig,
@@ -381,6 +384,8 @@ pub(crate) struct Socket {
     /// Metrics
     pub(crate) metrics: EndpointMetrics,
     pub(crate) hooks: EndpointHooksList,
+    /// Which classes of network path this endpoint may create and use.
+    pub(crate) path_policy: path_policy::PathPolicy,
     /// Tracing span for this endpoint.
     pub(crate) span: Span,
 }
@@ -666,12 +671,18 @@ impl Socket {
     ///
     /// Called whenever our addresses or home relay endpoint changes.
     fn publish_my_addr(&self) {
-        let relay_url = self.my_relay();
-        let mut addrs: Vec<_> = self
-            .direct_addrs
-            .sockaddrs()
-            .map(TransportAddr::Ip)
-            .collect();
+        // Discovery data names only path classes the policy allows.
+        let relay_url = self
+            .my_relay()
+            .filter(|_| self.path_policy.allows(path_policy::PathClasses::RELAY));
+        let mut addrs: Vec<_> = if self.path_policy.allows(path_policy::PathClasses::DIRECT) {
+            self.direct_addrs
+                .sockaddrs()
+                .map(TransportAddr::Ip)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let user_data = self
             .address_lookup_user_data
@@ -798,8 +809,16 @@ impl DirectAddrUpdateState {
             return;
         }
 
-        self.sock.metrics.net_report.portmap_attempts.inc();
-        self.port_mapper.procure_mapping();
+        if self
+            .sock
+            .path_policy
+            .allows(path_policy::PathClasses::DIRECT)
+        {
+            self.sock.metrics.net_report.portmap_attempts.inc();
+            self.port_mapper.procure_mapping();
+        } else {
+            self.port_mapper.deactivate();
+        }
 
         trace!("requesting net_report report");
         let sock = self.sock.clone();
@@ -849,6 +868,8 @@ pub enum BindError {
     CreateNetmonMonitor { source: AnyError },
     #[error("Invalid transport configuration")]
     InvalidTransportConfig,
+    #[error("A configured transport is of a path class the path policy does not allow")]
+    PathPolicyViolation,
     #[error("Invalid CA root configuration")]
     InvalidCaRootConfig { source: io::Error },
     #[error("Failed to create an address lookup service")]
@@ -887,9 +908,23 @@ impl EndpointInner {
             path_selector,
             portmapper_config,
             net_report_config,
+            path_policy,
             static_config,
             configured_addrs,
         } = opts;
+
+        // Creation boundary: never construct a transport of a class the policy refuses.
+        for config in &transport_configs {
+            if !path_policy.allows(config.path_class()) {
+                bail!(BindError::PathPolicyViolation);
+            }
+        }
+        // Port mapping talks to the gateway on behalf of direct paths.
+        let portmapper_config = if path_policy.allows(path_policy::PathClasses::DIRECT) {
+            portmapper_config
+        } else {
+            portmapper::PortmapperConfig::Disabled
+        };
 
         let address_lookup =
             address_lookup::AddressLookupServices::with_metrics(metrics.address_lookup.clone());
@@ -939,6 +974,7 @@ impl EndpointInner {
             relay_actor_config,
             &metrics,
             shutdown_token.child_token(),
+            path_policy.clone(),
         )
         .map_err(|err| e!(BindError::Sockets, err))?;
 
@@ -978,6 +1014,7 @@ impl EndpointInner {
                 address_lookup.clone(),
                 shutdown_token.child_token(),
                 path_selector,
+                path_policy.clone(),
                 span.clone(),
             )
         };
@@ -1005,6 +1042,7 @@ impl EndpointInner {
             tls_config: tls_config.clone(),
             proxy_url: proxy_url.clone(),
             hooks,
+            path_policy,
             span: span.clone(),
         });
 
@@ -1304,7 +1342,7 @@ impl EndpointInner {
     }
 
     #[cfg(all(test, with_crypto_provider))]
-    async fn force_network_change(&self, is_major: bool) {
+    pub(crate) async fn force_network_change(&self, is_major: bool) {
         self.actor_sender
             .send(ActorMessage::ForceNetworkChange(is_major))
             .await
@@ -2206,6 +2244,7 @@ mod tests {
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
             net_report_config: Default::default(),
+            path_policy: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         }
@@ -2622,6 +2661,7 @@ mod tests {
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
             net_report_config: Default::default(),
+            path_policy: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         };

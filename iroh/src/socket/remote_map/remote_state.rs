@@ -36,6 +36,7 @@ use crate::{
     endpoint::DirectAddr,
     socket::{
         Metrics as SocketMetrics, RELAY_PATH_MAX_IDLE_TIMEOUT,
+        path_policy::{PathClasses, PathPolicy},
         remote_map::remote_state::path_watcher::PathStateSender,
         transports::{self, OwnedTransmit, TransportsSender},
     },
@@ -172,6 +173,8 @@ struct State {
 
     /// The path selector used to pick the preferred path among the candidates.
     path_selector: Arc<dyn PathSelector>,
+    /// Which classes of network path may be created and used (Xross fork).
+    path_policy: PathPolicy,
 }
 
 impl RemoteStateActor {
@@ -183,6 +186,7 @@ impl RemoteStateActor {
         metrics: Arc<SocketMetrics>,
         address_lookup: AddressLookupServices,
         path_selector: Arc<dyn PathSelector>,
+        path_policy: PathPolicy,
     ) -> Self {
         Self {
             connections: FxHashMap::default(),
@@ -203,6 +207,7 @@ impl RemoteStateActor {
                 pending_open_paths: VecDeque::new(),
                 address_lookup_stream: None,
                 path_selector,
+                path_policy,
             },
         }
     }
@@ -405,7 +410,7 @@ impl RemoteStateActor {
         self.state.connections_close.push(OnClosed::new(&conn));
 
         // Add local addrs to the connection
-        let local_addrs = self.state.local_candidates();
+        let local_addrs = self.state.qnt_candidates();
         update_qnt_candidates(&conn, &local_addrs);
 
         // Store the connection
@@ -496,7 +501,7 @@ impl RemoteStateActor {
     /// Each connection needs to have the local direct addresses to use as QNT address
     /// candidates.
     fn update_local_direct_address(&mut self) {
-        let local_addrs = self.state.local_candidates();
+        let local_addrs = self.state.qnt_candidates();
         for conn in self.connections.values().filter_map(|s| s.handle.upgrade()) {
             update_qnt_candidates(&conn, &local_addrs);
         }
@@ -515,6 +520,12 @@ impl RemoteStateActor {
     ///   last attempt **and** there was a recent attempt, a trigger_holepunching call
     ///   will be scheduled instead.
     fn trigger_holepunching(&mut self) {
+        // Creation boundary: hole punching only ever creates direct paths.
+        if !self.state.path_policy.admit_holepunch() {
+            trace!("not holepunching: direct paths not allowed by the path policy");
+            self.state.scheduled_holepunch = None;
+            return;
+        }
         if self.connections.is_empty() {
             trace!("not holepunching: no connections");
             return;
@@ -592,6 +603,9 @@ impl RemoteStateActor {
                     trace!("path open event for unknown path");
                     return;
                 };
+                if !self.state.admit_established(&path) {
+                    return;
+                }
 
                 self.state
                     .register_and_configure_path(conn_id, conn_state, &path);
@@ -872,7 +886,9 @@ impl State {
         addrs: BTreeSet<TransportAddr>,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
     ) {
-        let addrs = to_transports_addr(self.endpoint_id, addrs);
+        let policy = self.path_policy.clone();
+        let addrs =
+            to_transports_addr(self.endpoint_id, addrs).filter(|a| policy.admit_candidate(a));
         self.paths.insert_multiple(addrs, Source::App);
         self.paths.resolve_remote(tx);
         // Start Address Lookup if we have no selected path.
@@ -931,8 +947,10 @@ impl State {
                     let source = Source::AddressLookup {
                         name: item.provenance().to_string(),
                     };
+                    let policy = self.path_policy.clone();
                     let addrs =
-                        to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs);
+                        to_transports_addr(self.endpoint_id, item.into_endpoint_addr().addrs)
+                            .filter(|a| policy.admit_candidate(a));
                     self.paths.insert_multiple(addrs, source);
                 }
             }
@@ -1064,6 +1082,11 @@ impl State {
         if conn_state.paths.values().any(|a| a == open_4tuple) {
             return;
         }
+        // Creation boundary: never open a path of a class the policy refuses.
+        if !self.path_policy.admit_path_open(open_4tuple) {
+            trace!(%open_4tuple, "path policy refused opening path");
+            return;
+        }
 
         let mapped_4tuple = self.mapped_addrs.to_mapped_tuple(open_4tuple);
         let path_status = self.path_status_for_addr(open_4tuple);
@@ -1104,6 +1127,40 @@ impl State {
         } else {
             PathStatus::Backup
         }
+    }
+
+    /// The local addresses to advertise as QUIC NAT traversal candidates.
+    ///
+    /// Empty while direct paths are not allowed, so the remote is not told our addresses
+    /// and has nothing to punch towards.
+    fn qnt_candidates(&mut self) -> BTreeSet<SocketAddr> {
+        if self.path_policy.allows(PathClasses::DIRECT) {
+            self.local_candidates()
+        } else {
+            BTreeSet::new()
+        }
+    }
+
+    /// Creation boundary for paths noq established, including remote-opened ones.
+    ///
+    /// Closes the path and returns `false` if its class is not allowed.
+    fn admit_established(&self, path: &noq::Path) -> bool {
+        let Some(network_path) = path
+            .network_path()
+            .ok()
+            .and_then(|p| self.mapped_addrs.to_transport_tuple(&p))
+        else {
+            return true;
+        };
+        if self.path_policy.allows(PathClasses::of_path(&network_path)) {
+            return true;
+        }
+        self.path_policy.record_path_closed(&network_path);
+        debug!(%network_path, "path policy closing established path");
+        if let Err(err) = path.close() {
+            debug!(?err, %network_path, "closing refused path failed");
+        }
+        false
     }
 
     /// Returns the current set of local direct addresses.

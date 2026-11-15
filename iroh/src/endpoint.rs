@@ -50,6 +50,7 @@ pub mod transports {
 use self::hooks::EndpointHooksList;
 pub use super::socket::{
     BindError, DirectAddr, DirectAddrType,
+    path_policy::{PathClasses, PathPolicy, PathPolicyError, PathPolicySnapshot, PathPolicyStats},
     remote_map::{
         Path, PathEvent, PathEventStream, PathList, PathListIter, PathListStream, RemoteInfo,
         TransportAddrInfo, TransportAddrUsage,
@@ -148,6 +149,7 @@ pub struct Builder {
     path_selector: Arc<dyn PathSelector>,
     portmapper_config: PortmapperConfig,
     net_report_config: NetReportConfig,
+    path_policy: PathPolicy,
     crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
     configured_addrs: BTreeSet<SocketAddr>,
 }
@@ -216,6 +218,7 @@ impl Builder {
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
             net_report_config: Default::default(),
+            path_policy: PathPolicy::permissive(),
             crypto_provider: None,
             configured_addrs: Default::default(),
         }
@@ -282,6 +285,7 @@ impl Builder {
             path_selector: self.path_selector,
             portmapper_config: self.portmapper_config,
             net_report_config: self.net_report_config,
+            path_policy: self.path_policy,
             static_config,
             configured_addrs: self.configured_addrs,
         };
@@ -850,6 +854,18 @@ impl Builder {
         self.path_selector = selector;
         self
     }
+
+    /// Confines the endpoint to the classes of network path in `policy` (Xross fork).
+    ///
+    /// Binding fails with [`BindError::PathPolicyViolation`] if a configured transport is of
+    /// a class the policy does not allow: clear IP transports, disable relays or omit custom
+    /// transports first. The policy is then checked when paths and candidates are created,
+    /// for every datagram sent, and for every datagram received before QUIC sees it.
+    /// Keep a clone to narrow or fence it later; see [`PathPolicy`].
+    pub fn path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
+    }
 }
 
 #[allow(missing_docs)]
@@ -934,6 +950,8 @@ pub enum ConnectWithOptsError {
     EndpointClosed,
     #[error("Invalid ALPN")]
     InvalidAlpn,
+    #[error("The path policy allows no network path")]
+    PathPolicyFenced,
 }
 
 #[allow(missing_docs)]
@@ -1112,6 +1130,9 @@ impl Endpoint {
         if self.is_closed() {
             return Err(e!(ConnectWithOptsError::EndpointClosed));
         }
+        if self.inner.path_policy.is_fenced() {
+            return Err(e!(ConnectWithOptsError::PathPolicyFenced));
+        }
 
         let endpoint_addr: EndpointAddr = endpoint_addr.into();
         let endpoint_id = endpoint_addr.id;
@@ -1188,6 +1209,14 @@ impl Endpoint {
     /// Returns the secret_key of this endpoint.
     pub fn secret_key(&self) -> &SecretKey {
         &self.inner.static_config.tls_config.secret_key
+    }
+
+    /// Returns the [`PathPolicy`] confining this endpoint (Xross fork).
+    ///
+    /// The returned handle shares state with the endpoint: narrowing or fencing it takes
+    /// effect at the next check of every boundary.
+    pub fn path_policy(&self) -> &PathPolicy {
+        &self.inner.path_policy
     }
 
     /// Returns the endpoint id of this endpoint.
