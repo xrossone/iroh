@@ -1317,15 +1317,20 @@ impl Endpoint {
         let watch_addrs = self.inner.ip_addrs();
         let watch_relay = self.inner.home_relay();
         let endpoint_id = self.id();
+        let policy = self.inner.path_policy.clone();
 
+        // Only classes the path policy allows are exposed. The filter runs whenever the
+        // watched value is recomputed, so `addr()` always reflects the current policy.
         watch_addrs.or(watch_relay).map(move |(addrs, relays)| {
-            EndpointAddr::from_parts(
-                endpoint_id,
-                relays
-                    .into_iter()
-                    .map(TransportAddr::Relay)
-                    .chain(addrs.into_iter().map(|x| TransportAddr::Ip(x.addr))),
-            )
+            let relays = relays
+                .into_iter()
+                .filter(|_| policy.allows(PathClasses::RELAY))
+                .map(TransportAddr::Relay);
+            let ips = addrs
+                .into_iter()
+                .filter(|_| policy.allows(PathClasses::DIRECT))
+                .map(|x| TransportAddr::Ip(x.addr));
+            EndpointAddr::from_parts(endpoint_id, relays.chain(ips))
         })
     }
 
@@ -1346,8 +1351,16 @@ impl Endpoint {
         // of connecting to us.
         let watch_relay = self.inner.home_relay();
         let endpoint_id = self.id();
+        let policy = self.inner.path_policy.clone();
         watch_relay.map(move |mut relays| {
-            EndpointAddr::from_parts(endpoint_id, relays.into_iter().map(TransportAddr::Relay))
+            let allowed = policy.allows(PathClasses::RELAY);
+            EndpointAddr::from_parts(
+                endpoint_id,
+                relays
+                    .into_iter()
+                    .filter(move |_| allowed)
+                    .map(TransportAddr::Relay),
+            )
         })
     }
 

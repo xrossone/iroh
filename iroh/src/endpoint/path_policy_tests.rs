@@ -399,3 +399,69 @@ async fn strict_stale_epoch_cannot_send() -> Result {
     server.close().await;
     Ok(())
 }
+
+/// Guards (review A1): bind refuses configured external addresses without DIRECT,
+/// `add_external_addr` is refused without DIRECT, and `addr()` exposes only allowed classes,
+/// also after a runtime `restrict`.
+#[tokio::test]
+#[traced_test]
+async fn strict_address_exposure_follows_policy() -> Result {
+    let (relay_map, _url, _server) = run_relay_server().await?;
+    let relay_only = || PathPolicy::strict(PathClasses::RELAY, 1).unwrap();
+    let external: SocketAddr = "192.0.2.10:7777".parse().unwrap();
+
+    let err = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+        .path_policy(relay_only())
+        .relay_mode(RelayMode::Custom(relay_map.clone()))
+        .clear_ip_transports()
+        .external_addr(external)
+        .bind()
+        .await
+        .expect_err("an external address under a relay-only policy must fail bind");
+    assert!(
+        matches!(err, BindError::PathPolicyViolation { .. }),
+        "{err:?}"
+    );
+
+    let ep = endpoint(relay_only(), Some(relay_map.clone()), false).await?;
+    ep.add_external_addr(external).await;
+    assert!(
+        !ep.remove_external_addr(&external).await,
+        "a relay-only endpoint stored an external address"
+    );
+    ep.online().await;
+    assert!(
+        !ep.addr().addrs.iter().any(|a| a.is_ip()),
+        "a relay-only endpoint exposes a direct address"
+    );
+
+    let open = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+        .relay_mode(RelayMode::Custom(relay_map.clone()))
+        .external_addr(external)
+        .bind()
+        .await?;
+    open.online().await;
+    let wanted = TransportAddr::Ip(external);
+    time::timeout(Duration::from_secs(10), async {
+        while !open.addr().addrs.contains(&wanted) {
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .std_context("external address never exposed")?;
+    open.path_policy().restrict(1, PathClasses::RELAY).unwrap();
+    let addr = open.addr();
+    assert!(
+        !addr.addrs.iter().any(|a| a.is_ip()),
+        "a direct address is exposed after restrict: {addr:?}"
+    );
+    assert!(addr.addrs.iter().any(|a| a.is_relay()));
+
+    ep.close().await;
+    open.close().await;
+    Ok(())
+}

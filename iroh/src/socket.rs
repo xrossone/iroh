@@ -937,6 +937,10 @@ impl EndpointInner {
                 bail!(BindError::PathPolicyViolation);
             }
         }
+        // Configured external addresses are direct addresses we would advertise.
+        if !configured_addrs.is_empty() && !path_policy.allows(path_policy::PathClasses::DIRECT) {
+            bail!(BindError::PathPolicyViolation);
+        }
         // Port mapping talks to the gateway on behalf of direct paths.
         let portmapper_config = if path_policy.allows(path_policy::PathClasses::DIRECT) {
             portmapper_config
@@ -1316,6 +1320,10 @@ impl EndpointInner {
 
     /// Adds an external address to advertise to peers.
     pub(crate) async fn add_external_addr(&self, addr: SocketAddr) {
+        if !self.sock.path_policy.allows(path_policy::PathClasses::DIRECT) {
+            warn!("path policy does not allow direct paths; external address not added");
+            return;
+        }
         self.sock
             .configured_addrs
             .write()
@@ -1944,7 +1952,12 @@ impl Actor {
         self.collect_local_addresses(&mut addrs);
 
         // Add configured external addresses.
-        for addr in self.sock.configured_addrs.read().expect("poisoned").iter() {
+        let configured = if self.sock.path_policy.allows(path_policy::PathClasses::DIRECT) {
+            self.sock.configured_addrs.read().expect("poisoned").clone()
+        } else {
+            BTreeSet::new()
+        };
+        for addr in configured.iter() {
             addrs.entry(*addr).or_insert((DirectAddrType::Config, None));
         }
 
