@@ -586,6 +586,7 @@ impl Socket {
         bufs: &mut [io::IoSliceMut<'_>],
         metas: &mut [noq_udp::RecvMeta],
         recv_infos: &[transports::RecvInfo],
+        denied: &[bool],
     ) {
         assert_eq!(bufs.len(), metas.len(), "non matching bufs & metas");
         assert_eq!(
@@ -596,6 +597,10 @@ impl Socket {
 
         // zip is slow :(
         for i in 0..metas.len() {
+            if denied.get(i).copied().unwrap_or(false) {
+                // Refused by the path policy: already hidden from noq, allocate nothing.
+                continue;
+            }
             let noq_meta = &mut metas[i];
             let recv_info = &recv_infos[i];
             let remote_addr = recv_info.remote();
@@ -886,6 +891,19 @@ pub enum BindError {
     },
 }
 
+/// The noq endpoint configuration every iroh endpoint uses.
+fn quic_endpoint_config() -> noq::EndpointConfig {
+    let mut endpoint_config =
+        noq::EndpointConfig::new(Arc::new(Blake3HmacKey::new(&mut rand::rng())));
+    // Setting this to false means that noq will ignore packets that have the QUIC fixed bit
+    // set to 0. The fixed bit is the 3rd bit of the first byte of a packet.
+    // For performance reasons and to not rewrite buffers we pass non-QUIC UDP packets straight
+    // through to noq. We set the first byte of the packet to zero, which makes noq ignore
+    // the packet if grease_quic_bit is set to false.
+    endpoint_config.grease_quic_bit(false);
+    endpoint_config
+}
+
 impl EndpointInner {
     /// Creates a [`EndpointInner`].
     pub(crate) async fn bind(opts: Options) -> Result<Self, BindError> {
@@ -1046,14 +1064,7 @@ impl EndpointInner {
             span: span.clone(),
         });
 
-        let mut endpoint_config =
-            noq::EndpointConfig::new(Arc::new(Blake3HmacKey::new(&mut rand::rng())));
-        // Setting this to false means that noq will ignore packets that have the QUIC fixed bit
-        // set to 0. The fixed bit is the 3rd bit of the first byte of a packet.
-        // For performance reasons and to not rewrite buffers we pass non-QUIC UDP packets straight
-        // through to noq. We set the first byte of the packet to zero, which makes noq ignore
-        // the packet if grease_quic_bit is set to false.
-        endpoint_config.grease_quic_bit(false);
+        let endpoint_config = quic_endpoint_config();
 
         let local_addrs_watch = transports.local_addrs_watch();
         let transports_network_change = transports.create_network_change_sender();
@@ -2931,5 +2942,23 @@ mod tests {
 
         // TODO: could remove the addresses again, send, add it back and see it recover.
         // But we don't have that much private access to the RemoteMap.  This will do for now.
+    }
+}
+
+#[cfg(test)]
+mod strict_recv_tests {
+    use super::quic_endpoint_config;
+
+    /// Pins the endpoint's QUIC greasing setting. iroh hands non-QUIC datagrams to noq with
+    /// byte 0 zeroed and relies on noq discarding them; that only holds with greasing off.
+    /// The path-policy receive gate no longer depends on it (it hides refused datagrams with
+    /// `len = 0`), but a change here must be a deliberate, reviewed one.
+    #[test]
+    fn quic_greasing_stays_off() {
+        let config = format!("{:?}", quic_endpoint_config());
+        assert!(
+            config.contains("grease_quic_bit: false"),
+            "noq greasing changed: {config}"
+        );
     }
 }

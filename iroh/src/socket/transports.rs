@@ -284,35 +284,36 @@ impl Transports {
             Poll::Pending => Poll::Pending,
             Poll::Ready(0) => Poll::Ready(Ok(0)),
             Poll::Ready(n) => {
-                self.drop_disallowed(&mut bufs[..n], &metas[..n]);
-                sock.process_datagrams(&mut bufs[..n], &mut metas[..n], &self.recv_infos[..n]);
+                let denied = self.drop_disallowed(&mut metas[..n]);
+                sock.process_datagrams(
+                    &mut bufs[..n],
+                    &mut metas[..n],
+                    &self.recv_infos[..n],
+                    &denied[..n],
+                );
                 Poll::Ready(Ok(n))
             }
         }
     }
 
-    /// Receive boundary: makes QUIC drop every datagram from a path class the policy refuses.
+    /// Receive boundary: hides every datagram from a path class the policy refuses.
     ///
-    /// The endpoint runs noq with `grease_quic_bit(false)`, so a datagram whose first byte has
-    /// the QUIC fixed bit unset is discarded during header decoding, before any connection,
-    /// path or migration state is touched. Zeroing the first byte of each segment uses that.
-    fn drop_disallowed(&self, bufs: &mut [IoSliceMut<'_>], metas: &[noq_udp::RecvMeta]) {
-        for ((buf, meta), info) in bufs.iter_mut().zip(metas).zip(&self.recv_infos) {
-            if self.path_policy.admit_recv(info.remote()) {
-                continue;
-            }
-            let len = meta.len.min(buf.len());
-            let stride = if meta.stride == 0 {
-                len.max(1)
-            } else {
-                meta.stride
-            };
-            let mut offset = 0;
-            while offset < len {
-                buf[offset] = 0;
-                offset += stride;
+    /// A refused datagram gets `len = 0`, so noq never decodes it: no connection, path,
+    /// migration, version-negotiation or stateless-reset handling sees it, whatever the
+    /// endpoint's QUIC greasing setting. Returns which entries were refused, so the socket
+    /// can skip them too (no mapped-address allocation from refused input).
+    pub(super) fn drop_disallowed(
+        &self,
+        metas: &mut [noq_udp::RecvMeta],
+    ) -> [bool; noq_udp::BATCH_SIZE] {
+        let mut denied = [false; noq_udp::BATCH_SIZE];
+        for ((meta, info), denied) in metas.iter_mut().zip(&self.recv_infos).zip(&mut denied) {
+            if !self.path_policy.admit_recv(info.remote()) {
+                meta.len = 0;
+                *denied = true;
             }
         }
+        denied
     }
 
     /// Tries to recv data, on all available transports.
@@ -1451,6 +1452,47 @@ mod tests {
             consecutive_total_recv_failures: 0,
             path_policy: PathPolicy::permissive(),
         }
+    }
+
+    /// A refused datagram shaped like a QUIC stateless reset (short header with the fixed
+    /// bit set, random middle, 16-byte token at the end) must never reach noq: whatever the
+    /// greasing setting, a reset arriving on a disallowed path could otherwise close the
+    /// connection. The gate hides it by length, and leaves allowed datagrams untouched.
+    #[test]
+    fn refused_stateless_reset_shaped_datagram_is_hidden_from_quic() {
+        let mut transports = custom_only_transports(Vec::new());
+        transports.path_policy = crate::socket::path_policy::PathPolicy::strict(
+            crate::socket::path_policy::PathClasses::RELAY,
+            1,
+        )
+        .unwrap();
+        let relay_url: RelayUrl = "https://relay.example".parse().unwrap();
+        let peer = iroh_base::SecretKey::from_bytes(&[3u8; 32]).public();
+        transports.recv_infos[0] = RecvInfo::from_addr(Addr::Ip("192.0.2.7:4433".parse().unwrap()));
+        transports.recv_infos[1] = RecvInfo::from_addr(Addr::Relay(relay_url, peer));
+
+        let mut reset = [0u8; 43];
+        reset[0] = 0x40 | 0x07; // short header, fixed bit set
+        for (i, b) in reset[1..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let original = reset;
+        let mut metas = [noq_udp::RecvMeta::default(); 2];
+        for meta in &mut metas {
+            meta.len = reset.len();
+            meta.stride = reset.len();
+        }
+
+        let denied = transports.drop_disallowed(&mut metas);
+
+        assert!(denied[0], "the direct datagram must be refused");
+        assert_eq!(metas[0].len, 0, "noq must see an empty datagram");
+        assert!(!denied[1], "the relay datagram is allowed");
+        assert_eq!(metas[1].len, reset.len(), "allowed datagram untouched");
+        assert_eq!(
+            reset, original,
+            "the gate does not depend on rewriting bytes"
+        );
     }
 
     fn ready_custom_endpoint(id: u8, polls: Arc<AtomicUsize>) -> Box<dyn CustomEndpoint> {
