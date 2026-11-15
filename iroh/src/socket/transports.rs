@@ -1458,6 +1458,10 @@ mod tests {
     /// bit set, random middle, 16-byte token at the end) must never reach noq: whatever the
     /// greasing setting, a reset arriving on a disallowed path could otherwise close the
     /// connection. The gate hides it by length, and leaves allowed datagrams untouched.
+    ///
+    /// `noq_udp::BATCH_SIZE` is 1 on platforms without batched receive (Windows), so the
+    /// single-entry checks run everywhere and the mixed batch only where batching exists.
+    /// Indices past the first go through `get`/`get_mut`, never a constant index.
     #[test]
     fn refused_stateless_reset_shaped_datagram_is_hidden_from_quic() {
         let mut transports = custom_only_transports(Vec::new());
@@ -1468,8 +1472,8 @@ mod tests {
         .unwrap();
         let relay_url: RelayUrl = "https://relay.example".parse().unwrap();
         let peer = iroh_base::SecretKey::from_bytes(&[3u8; 32]).public();
-        transports.recv_infos[0] = RecvInfo::from_addr(Addr::Ip("192.0.2.7:4433".parse().unwrap()));
-        transports.recv_infos[1] = RecvInfo::from_addr(Addr::Relay(relay_url, peer));
+        let direct = RecvInfo::from_addr(Addr::Ip("192.0.2.7:4433".parse().unwrap()));
+        let relay = RecvInfo::from_addr(Addr::Relay(relay_url, peer));
 
         let mut reset = [0u8; 43];
         reset[0] = 0x40 | 0x07; // short header, fixed bit set
@@ -1477,18 +1481,43 @@ mod tests {
             *b = (i as u8).wrapping_mul(37).wrapping_add(11);
         }
         let original = reset;
-        let mut metas = [noq_udp::RecvMeta::default(); 2];
-        for meta in &mut metas {
-            meta.len = reset.len();
-            meta.stride = reset.len();
-        }
+        let fresh = |n: usize| {
+            let mut metas = vec![noq_udp::RecvMeta::default(); n];
+            for meta in &mut metas {
+                meta.len = reset.len();
+                meta.stride = reset.len();
+            }
+            metas
+        };
 
+        // Every platform: one refused entry, then one allowed entry.
+        transports.recv_infos[0] = direct.clone();
+        let mut metas = fresh(1);
         let denied = transports.drop_disallowed(&mut metas);
-
         assert!(denied[0], "the direct datagram must be refused");
         assert_eq!(metas[0].len, 0, "noq must see an empty datagram");
-        assert!(!denied[1], "the relay datagram is allowed");
-        assert_eq!(metas[1].len, reset.len(), "allowed datagram untouched");
+
+        transports.recv_infos[0] = relay.clone();
+        let mut metas = fresh(1);
+        let denied = transports.drop_disallowed(&mut metas);
+        assert!(!denied[0], "the relay datagram is allowed");
+        assert_eq!(metas[0].len, reset.len(), "allowed datagram untouched");
+
+        // Batching platforms: a refused entry next to an allowed one in the same batch.
+        if noq_udp::BATCH_SIZE > 1 {
+            transports.recv_infos[0] = direct;
+            *transports.recv_infos.get_mut(1).expect("BATCH_SIZE > 1") = relay;
+            let mut metas = fresh(2);
+            let denied = transports.drop_disallowed(&mut metas);
+            assert!(denied[0], "the direct datagram must be refused");
+            assert_eq!(metas[0].len, 0, "noq must see an empty datagram");
+            assert_eq!(
+                denied.get(1),
+                Some(&false),
+                "the relay datagram in the same batch is allowed"
+            );
+            assert_eq!(metas[1].len, reset.len(), "allowed datagram untouched");
+        }
         assert_eq!(
             reset, original,
             "the gate does not depend on rewriting bytes"
