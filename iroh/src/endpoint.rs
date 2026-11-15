@@ -2105,6 +2105,9 @@ fn is_cgi() -> bool {
 }
 
 #[cfg(all(test, with_crypto_provider))]
+mod path_policy_tests;
+
+#[cfg(all(test, with_crypto_provider))]
 mod tests {
     use std::{
         collections::BTreeMap,
