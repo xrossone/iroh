@@ -1130,6 +1130,10 @@ impl EndpointInner {
     /// [`Poll::Pending`]: std::task::Poll::Pending
     #[instrument(skip_all, parent = self.sock.span.clone())]
     pub(crate) async fn close(&self) {
+        self.close_with_drain_timeout(None).await;
+    }
+
+    pub(crate) async fn close_with_drain_timeout(&self, drain_timeout: Option<Duration>) {
         if self.sock.is_closed() || self.sock.is_closing() {
             return;
         }
@@ -1160,7 +1164,14 @@ impl EndpointInner {
         // If this call is skipped, then connections that protocols close just shortly before the
         // call to `Endpoint::close` will in most cases cause connection time-outs on remote ends.
         trace!("wait_all_draining start");
-        self.noq_endpoint().wait_all_draining().await;
+        match drain_timeout {
+            Some(timeout) => {
+                if time::timeout(timeout, self.noq_endpoint().wait_all_draining()).await.is_err() {
+                    warn!(deadline_ms = timeout.as_millis() as u64, "endpoint drain deadline reached");
+                }
+            }
+            None => self.noq_endpoint().wait_all_draining().await,
+        }
         trace!("wait_all_draining done");
 
         // Start cancellation of all actors.

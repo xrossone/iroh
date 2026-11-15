@@ -1734,6 +1734,13 @@ impl Endpoint {
         self.inner.close().await;
     }
 
+    /// Close with a bound on QUIC draining while still joining endpoint tasks.
+    /// Peers that miss the close notification must recover by their idle timeout.
+    /// This Xross-specific extension preserves the remainder of `close` cleanup.
+    pub async fn close_with_drain_timeout(&self, timeout: std::time::Duration) {
+        self.inner.close_with_drain_timeout(Some(timeout)).await;
+    }
+
     /// Check if this endpoint is still alive, or already closed.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
