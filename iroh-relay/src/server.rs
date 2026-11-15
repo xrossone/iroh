@@ -187,7 +187,21 @@ impl ConnectionId {
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
-
+    /// Reconstructs a [`ConnectionId`] from the `u64` an embedder recovered
+    /// via `Display` (see `connection_id_as_u64` in `xross-relay`'s
+    /// `lib.rs`).
+    ///
+    /// Xross addition: an embedder outside this crate has no accessor for
+    /// this type's inner value in either direction — it can read it out only
+    /// through the round-trip `Display`/`parse` `connection_id_as_u64` does,
+    /// and had no way at all to build one back up from a stored `u64`.
+    /// `Clients::disconnect` takes `Option<ConnectionId>`, and without this
+    /// constructor an embedder can only ever pass `None`, which disconnects
+    /// every connection for the endpoint rather than the one that was
+    /// actually denied.
+    pub fn from_u64(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 /// Details about an incoming relay client connection.
