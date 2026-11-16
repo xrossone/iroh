@@ -52,7 +52,6 @@ use std::{
 
 use iroh_base::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use n0_error::{ensure, stack_error};
-use url::Url;
 
 use crate::{
     attrs::{EncodingError, IrohAttr, ParseError, TxtAttrs},
@@ -510,8 +509,17 @@ fn endpoint_info_from_attrs(attrs: &TxtAttrs<IrohAttr>) -> EndpointInfo {
         .get(&IrohAttr::Relay)
         .into_iter()
         .flatten()
-        .filter_map(|s| Url::parse(s).ok())
-        .map(|url| TransportAddr::Relay(url.into()));
+        // Xross fork: parse through `RelayUrl`'s `FromStr`, which refuses input or normalized
+        // URLs over `MAX_RELAY_URL_LEN` bytes. Refused records are skipped like any other
+        // unparseable record.
+        .filter_map(|s| match RelayUrl::from_str(s) {
+            Ok(url) => Some(url),
+            Err(err) => {
+                tracing::debug!("ignoring relay record: {err}");
+                None
+            }
+        })
+        .map(TransportAddr::Relay);
     let addrs = a
         .get(&IrohAttr::Addr)
         .into_iter()
@@ -655,6 +663,39 @@ mod tests {
 
         assert_eq!(endpoint_info, expected_endpoint_info);
 
+        Ok(())
+    }
+
+    /// Xross fork: a `relay=` record longer than [`iroh_base::MAX_RELAY_URL_LEN`] never becomes
+    /// a [`TransportAddr::Relay`], so no path or relay connection can be created from it. The
+    /// same record at exactly the limit is kept. This covers DNS and pkarr, which share
+    /// `endpoint_info_from_attrs`.
+    #[test]
+    fn txt_relay_record_over_length_limit_is_dropped() -> Result {
+        use iroh_base::MAX_RELAY_URL_LEN;
+        let name = "_iroh.dgjpkxyn3zyrk3zfads5duwdgbqpkwbjxfj4yt7rezidr3fijccy.dns.iroh.link.";
+        let url_of_len = |len: usize| {
+            let prefix = "https://r.example/";
+            format!("{prefix}{}", "a".repeat(len - prefix.len()))
+        };
+        let lookup = |url: String| {
+            let records = vec![
+                TxtRecordData::from(vec!["addr=192.168.96.145:60165".to_string()]),
+                TxtRecordData::from(vec![format!("relay={url}")]),
+            ];
+            EndpointInfo::from_txt_lookup(name.to_string(), records.into_iter())
+        };
+
+        let kept = lookup(url_of_len(MAX_RELAY_URL_LEN))?;
+        assert_eq!(kept.relay_urls().count(), 1);
+
+        let dropped = lookup(url_of_len(MAX_RELAY_URL_LEN + 1))?;
+        assert_eq!(dropped.relay_urls().count(), 0);
+        assert_eq!(
+            dropped.ip_addrs().count(),
+            1,
+            "other records are still used"
+        );
         Ok(())
     }
 }

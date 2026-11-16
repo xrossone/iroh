@@ -1606,7 +1606,15 @@ fn to_transports_addr(
     addrs: impl IntoIterator<Item = TransportAddr>,
 ) -> impl Iterator<Item = transports::Addr> {
     addrs.into_iter().filter_map(move |addr| match addr {
-        TransportAddr::Relay(relay_url) => Some(transports::Addr::from((relay_url, endpoint_id))),
+        // Xross fork: every application address and every address lookup item passes here
+        // before it becomes a path candidate. Drop relay URLs over `MAX_RELAY_URL_LEN`.
+        TransportAddr::Relay(relay_url) => match relay_url.check_len() {
+            Ok(()) => Some(transports::Addr::from((relay_url, endpoint_id))),
+            Err(err) => {
+                warn!("ignoring relay address: {err}");
+                None
+            }
+        },
         TransportAddr::Ip(sockaddr) => Some(transports::Addr::from(sockaddr)),
         TransportAddr::Custom(custom_addr) => Some(transports::Addr::from(custom_addr)),
         _ => {
@@ -1627,6 +1635,39 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
 #[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
+
+    /// Xross fork: `to_transports_addr` is where both application addresses
+    /// (`ResolveRemote`) and every address lookup item (unwrapped providers included) become
+    /// path candidates. A relay URL over [`iroh_base::MAX_RELAY_URL_LEN`] bytes must not become
+    /// a candidate, so no path, mapped address or relay connection is created for it; other
+    /// addresses in the same set are kept, and a URL at the limit is kept.
+    #[test]
+    fn overlong_relay_url_never_becomes_a_path_candidate() {
+        use iroh_base::{MAX_RELAY_URL_LEN, RelayUrl};
+        let url_of_len = |len: usize| {
+            let prefix = "https://r.example/";
+            let s = format!("{prefix}{}", "a".repeat(len - prefix.len()));
+            RelayUrl::from(url::Url::parse(&s).unwrap())
+        };
+        let id = iroh_base::SecretKey::from_bytes(&[1; 32]).public();
+        let ip: std::net::SocketAddr = "192.0.2.1:1234".parse().unwrap();
+
+        let candidates: Vec<_> = to_transports_addr(
+            id,
+            [
+                TransportAddr::Relay(url_of_len(MAX_RELAY_URL_LEN)),
+                TransportAddr::Relay(url_of_len(MAX_RELAY_URL_LEN + 1)),
+                TransportAddr::Ip(ip),
+            ],
+        )
+        .collect();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert!(candidates.contains(&transports::Addr::from(ip)));
+        assert!(candidates.iter().all(|addr| match addr {
+            transports::Addr::Relay(url, _) => url.as_str().len() <= MAX_RELAY_URL_LEN,
+            _ => true,
+        }));
+    }
 
     #[tokio::test]
     async fn blocked_relay_does_not_delay_direct_initial() {

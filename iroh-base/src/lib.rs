@@ -18,4 +18,4 @@ pub use self::key::{
     SignatureParsingError,
 };
 #[cfg(feature = "relay")]
-pub use self::relay_url::{RelayUrl, RelayUrlParseError};
+pub use self::relay_url::{MAX_RELAY_URL_LEN, RelayUrl, RelayUrlParseError};

@@ -893,6 +893,11 @@ pub enum BindError {
     InvalidTransportConfig,
     #[error("A configured transport is of a path class the path policy does not allow")]
     PathPolicyViolation,
+    /// A configured relay URL is over [`iroh_base::MAX_RELAY_URL_LEN`] bytes (Xross fork).
+    #[error("A configured relay URL is too long")]
+    RelayUrlTooLong {
+        source: iroh_base::RelayUrlParseError,
+    },
     #[error("Invalid CA root configuration")]
     InvalidCaRootConfig { source: io::Error },
     #[error("Failed to create an address lookup service")]
@@ -953,6 +958,15 @@ impl EndpointInner {
         for config in &transport_configs {
             if !path_policy.allows(config.path_class()) {
                 bail!(BindError::PathPolicyViolation);
+            }
+        }
+        // Xross fork: configured relay URLs are bounded like every other relay URL ingress.
+        for config in &transport_configs {
+            if let TransportConfig::Relay { relay_map, .. } = config {
+                for url in relay_map.urls::<Vec<_>>() {
+                    url.check_len()
+                        .map_err(|source| e!(BindError::RelayUrlTooLong { source }))?;
+                }
             }
         }
         // Configured external addresses are direct addresses we would advertise.

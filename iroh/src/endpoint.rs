@@ -952,6 +952,12 @@ pub enum ConnectWithOptsError {
     InvalidAlpn,
     #[error("The path policy allows no network path")]
     PathPolicyFenced,
+    /// A relay URL of the remote address is over [`iroh_base::MAX_RELAY_URL_LEN`] bytes
+    /// (Xross fork). Refused before any remote state, path or relay connection is created.
+    #[error("Relay URL of the remote address is too long")]
+    RelayUrlTooLong {
+        source: iroh_base::RelayUrlParseError,
+    },
 }
 
 #[allow(missing_docs)]
@@ -1136,6 +1142,15 @@ impl Endpoint {
 
         let endpoint_addr: EndpointAddr = endpoint_addr.into();
         let endpoint_id = endpoint_addr.id;
+
+        // Xross fork: refuse overlong relay URLs before any hook, remote state, path or
+        // relay connection sees them. String and serde ingress are bounded by `RelayUrl`
+        // itself; this covers values built with the infallible `From<Url>`.
+        for relay_url in endpoint_addr.relay_urls() {
+            relay_url
+                .check_len()
+                .map_err(|source| e!(ConnectWithOptsError::RelayUrlTooLong { source }))?;
+        }
 
         Span::current().record("remote", tracing::field::display(endpoint_id.fmt_short()));
 
@@ -2119,6 +2134,9 @@ fn is_cgi() -> bool {
 
 #[cfg(all(test, with_crypto_provider))]
 mod path_policy_tests;
+
+#[cfg(all(test, with_crypto_provider))]
+mod relay_url_bound_tests;
 
 #[cfg(all(test, with_crypto_provider))]
 mod tests {

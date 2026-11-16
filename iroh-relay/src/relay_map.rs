@@ -229,7 +229,14 @@ impl RelayMap {
     }
 
     /// Inserts a new relay into the relay map.
+    ///
+    /// Xross fork: a URL over [`iroh_base::MAX_RELAY_URL_LEN`] bytes is refused with a warning
+    /// and the map is left unchanged (returns `None`), so no relay connection is made for it.
     pub fn insert(&self, url: RelayUrl, endpoint: Arc<RelayConfig>) -> Option<Arc<RelayConfig>> {
+        if let Err(err) = url.check_len() {
+            tracing::warn!("relay not added: {err}");
+            return None;
+        }
         let mut state = self.relays.write().expect("poisoned");
         let previous = state.relays.get(&url).cloned();
         let mut endpoint = endpoint.as_ref().clone();
@@ -506,6 +513,35 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+
+    /// Xross fork: a runtime insert (directly, or through `extend`) of a relay URL over
+    /// [`iroh_base::MAX_RELAY_URL_LEN`] bytes is refused and leaves the map unchanged, so no
+    /// relay connection or probe is ever made for it. Parsing from strings refuses it too.
+    #[test]
+    fn relay_map_refuses_overlong_relay_url() {
+        use iroh_base::MAX_RELAY_URL_LEN;
+        let url_of_len = |len: usize| {
+            let prefix = "https://r.example/";
+            format!("{prefix}{}", "a".repeat(len - prefix.len()))
+        };
+        let ok = RelayUrl::from(url::Url::parse(&url_of_len(MAX_RELAY_URL_LEN)).unwrap());
+        let long = RelayUrl::from(url::Url::parse(&url_of_len(MAX_RELAY_URL_LEN + 1)).unwrap());
+
+        let map = RelayMap::empty();
+        assert!(map.insert(ok.clone(), Arc::new(ok.clone().into())).is_none());
+        assert!(map.contains(&ok));
+
+        assert!(map.insert(long.clone(), Arc::new(long.clone().into())).is_none());
+        assert!(!map.contains(&long));
+        assert_eq!(map.len(), 1);
+
+        let other = RelayMap::from(long.clone());
+        map.extend(&other);
+        assert!(!map.contains(&long));
+        assert_eq!(map.len(), 1);
+
+        assert!(RelayMap::try_from_iter([url_of_len(MAX_RELAY_URL_LEN + 1).as_str()]).is_err());
+    }
 
     #[test]
     fn relay_map_extend() {
